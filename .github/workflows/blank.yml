@@ -1,0 +1,302 @@
+# medieval_chess.py
+#
+# A 3D chess game with stylized medieval warrior pieces, built in Python
+# using the Ursina engine.
+#
+# To Run:
+# 1. pip install ursina python-chess
+# 2. python medieval_chess.py
+
+from ursina import *
+import chess
+import random
+
+class MedievalChess(Ursina):
+    """
+    The main class for the chess application, handling scene setup,
+    game logic, and user interaction.
+    """
+    def __init__(self):
+        super().__init__(
+            title='Medieval Chess',
+            borderless=False,
+            fullscreen=False,
+            size=(1280, 720),
+            vsync=True
+        )
+
+        # --- Game State and Logic ---
+        self.board = chess.Board()
+        self.piece_entities = {}  # Maps square name (e.g., 'e2') to its Ursina Entity
+        self.selected_piece_entity = None
+        self.highlight_squares = []
+
+        # --- Sound Effects (using built-in sounds) ---
+        self.move_sound = Audio('ursina_sounds/click.wav', loop=False, autoplay=False)
+        self.capture_sound = Audio('ursina_sounds/explosion.wav', loop=False, autoplay=False)
+        self.check_sound = Audio('ursina_sounds/ping.wav', loop=False, autoplay=False)
+
+        # --- Setup Scene ---
+        self.setup_scene()
+        self.create_board_and_pieces()
+        self.update_ui()
+
+    def setup_scene(self):
+        """Sets up the camera, lighting, and background environment."""
+        window.color = color.rgb(12, 10, 26)
+        
+        # Camera with orbit controls (right-click and drag to rotate)
+        EditorCamera()
+        camera.position = (0, 30, -35)
+        camera.fov = 45
+
+        # Lighting for shadows and reflections
+        pivot = Entity(position=(0, 10, 0))
+        DirectionalLight(parent=pivot, y=2, z=3, shadows=True, rotation=(45, -45, 45))
+        AmbientLight(color=color.rgba(255, 255, 255, 0.2))
+
+        # Fog for atmospheric effect
+        scene.fog_density = 0.015
+        scene.fog_color = window.color
+
+        # UI Elements for game information
+        self.turn_display = Text(origin=(-.5, .5), position=(-.88, .48), scale=1.5)
+        self.status_display = Text(origin=(-.5, .5), position=(-.88, .44), scale=1.5)
+        self.end_game_display = Text(origin=(0,0), scale=3, y=0.1, color=color.azure)
+        self.restart_button = Button("Play Again", y=-0.1, scale=0.15, on_click=self.restart_game, visible=False)
+
+
+    def create_piece_entity(self, piece: chess.Piece, square: int):
+        """Creates a visual entity for a given chess piece."""
+        square_name = chess.square_name(square)
+        pos = self.square_to_pos(square)
+        
+        # Define materials for white and black pieces
+        white_material = color.rgba(220, 220, 255, 240)
+        black_material = color.rgba(80, 48, 96, 240)
+        material = white_material if piece.color == chess.WHITE else black_material
+
+        # Create the main group entity for the piece
+        group = Entity(position=pos)
+        group.shader = 'lit_with_shadows_shader'
+        group.piece_info = piece # Store piece data in the entity
+        group.square_name = square_name
+        
+        piece_symbol = piece.symbol().lower()
+
+        # Build the piece shape from component parts
+        if piece_symbol == 'p': # Pawn
+            Entity(model='cylinder', scale=(1, 0.4, 1), y=-0.3, color=material, parent=group)
+            Entity(model='cone', scale=(1.2, 1, 1.2), y=0.2, color=material, parent=group)
+        elif piece_symbol == 'r': # Rook (Castle Tower)
+            Entity(model='cylinder', scale=(1.4, 1.2, 1.4), y=-0.1, color=material, parent=group)
+            for i in range(4):
+                angle = i * pi / 2
+                crenel = Entity(model='cube', scale=(0.5, 0.5, 0.5), position=(cos(angle) * 0.5, 0.7, sin(angle) * 0.5), parent=group, color=material)
+        elif piece_symbol == 'n': # Knight (Horse Head)
+            Entity(model='cube', scale=(1, 1.5, 1), y=0.05, color=material, parent=group)
+            Entity(model='cube', scale=(0.6, 0.8, 1.8), y=0.6, z=0.2, color=material, parent=group)
+        elif piece_symbol == 'b': # Bishop
+            Entity(model='cylinder', scale=(1.2, 1.4, 1.2), y=0, color=material, parent=group)
+            Entity(model='cone', scale=(1, 1.2, 1), y=1.1, color=material, parent=group)
+        elif piece_symbol == 'q': # Queen
+            Entity(model='cone', scale=(1.5, 2, 1.5), y=0.3, color=material, parent=group)
+            Entity(model='sphere', scale=0.5, y=1.5, color=material, parent=group)
+        elif piece_symbol == 'k': # King
+            Entity(model='cylinder', scale=(1.4, 1.8, 1.4), y=0.2, color=material, parent=group)
+            Entity(model='cube', scale=(0.2, 0.8, 0.2), y=1.3, color=material, parent=group)
+            Entity(model='cube', scale=(0.8, 0.2, 0.2), y=1.4, color=material, parent=group)
+        
+        group.collider = 'box' # Add collider after children are parented
+        group.scale *= 1.5 # Uniformly scale all pieces
+        self.piece_entities[square_name] = group
+
+    def create_board_and_pieces(self):
+        """Creates the visual board and populates it with piece entities."""
+        # Create Board Tiles with reflective texture
+        for i in range(8):
+            for j in range(8):
+                tile_color = color.rgb(44, 44, 62) if (i + j) % 2 == 1 else color.rgb(159, 168, 218)
+                tile = Entity(
+                    model='cube',
+                    color=tile_color,
+                    scale=(4, 0.5, 4),
+                    position=(j * 4 - 14, 0, i * 4 - 14),
+                    texture='reflection_map_3'
+                )
+        
+        # Create an entity for each piece on the board
+        for i in range(64):
+            piece = self.board.piece_at(i)
+            if piece:
+                self.create_piece_entity(piece, i)
+
+    def input(self, key):
+        """Handles user input, primarily mouse clicks."""
+        if self.board.is_game_over():
+            return
+            
+        if key == 'left mouse down':
+            entity = mouse.hovered_entity
+
+            # If we didn't click on anything, clear selection and return.
+            if not entity:
+                self.clear_highlights()
+                self.selected_piece_entity = None
+                return
+
+            # --- Move Execution on Highlight Square ---
+            if entity in self.highlight_squares:
+                if self.selected_piece_entity:
+                    from_square_name = self.selected_piece_entity.square_name
+                    to_square_name = self.pos_to_square(entity.position)
+                    move = chess.Move.from_uci(f"{from_square_name}{to_square_name}")
+                    
+                    # Check for promotion and auto-promote to Queen
+                    if self.board.piece_at(chess.parse_square(from_square_name)).piece_type == chess.PAWN:
+                        if chess.square_rank(chess.parse_square(to_square_name)) in [0, 7]:
+                             move.promotion = chess.QUEEN
+                    self.handle_move(move)
+                return
+
+            # --- Piece Selection ---
+            # Traverse up from the clicked part to find the main piece Group
+            clicked_piece_group = entity
+            while clicked_piece_group and not hasattr(clicked_piece_group, 'piece_info'):
+                clicked_piece_group = clicked_piece_group.parent
+            
+            # Clear previous selection before making a new one
+            self.clear_highlights()
+            self.selected_piece_entity = None
+
+            if clicked_piece_group and hasattr(clicked_piece_group, 'piece_info'):
+                # Check if the piece belongs to the current player
+                if clicked_piece_group.piece_info.color == self.board.turn:
+                    self.selected_piece_entity = clicked_piece_group
+                    self.highlight_valid_moves()
+
+    def handle_move(self, move: chess.Move):
+        """Processes a move, updates logic, and triggers animations."""
+        from_square = chess.square_name(move.from_square)
+        to_square = chess.square_name(move.to_square)
+        moving_entity = self.piece_entities[from_square]
+        
+        # Handle Capture
+        if self.board.is_capture(move):
+            self.capture_sound.play()
+            captured_square = to_square
+            if self.board.is_en_passant(move):
+                captured_square = chess.square_name(move.to_square - 8 if self.board.turn == chess.WHITE else move.to_square + 8)
+
+            captured_entity = self.piece_entities.pop(captured_square, None)
+            if captured_entity:
+                self.shatter_piece(captured_entity)
+        else:
+            self.move_sound.play()
+            
+        # Push the move to the python-chess board
+        self.board.push(move)
+        
+        # Animate the piece to its new position
+        new_pos = self.square_to_pos(move.to_square)
+        moving_entity.animate_position(new_pos, duration=0.4, curve=curve.out_quad)
+        
+        # Update our entity dictionary
+        moving_entity.square_name = to_square
+        self.piece_entities[to_square] = self.piece_entities.pop(from_square)
+
+        # Handle promotion by replacing the model
+        if move.promotion:
+            destroy(moving_entity)
+            self.create_piece_entity(self.board.piece_at(move.to_square), move.to_square)
+
+        # Clear selection and update UI
+        self.clear_highlights()
+        self.selected_piece_entity = None
+        self.update_ui()
+        
+    def shatter_piece(self, piece_entity):
+        """Creates a particle explosion effect for a captured piece."""
+        destroy(piece_entity)
+        for i in range(20):
+            particle = Entity(
+                model='sphere',
+                color=piece_entity.color,
+                scale=random.uniform(0.1, 0.4),
+                position=piece_entity.position
+            )
+            direction = Vec3(random.uniform(-1,1), random.uniform(1,2), random.uniform(-1,1)).normalized()
+            particle.animate_position(piece_entity.position + direction * 5, duration=random.uniform(0.5, 1.5), curve=curve.out_circ)
+            particle.fade_out(duration=random.uniform(0.5, 1.5), delay=0.2)
+            
+    def highlight_valid_moves(self):
+        """Creates visual highlights for all valid moves of the selected piece."""
+        selected_square = self.selected_piece_entity.square_name
+        for move in self.board.legal_moves:
+            if chess.square_name(move.from_square) == selected_square:
+                is_capture = self.board.is_capture(move)
+                highlight_color = color.rgba(255, 80, 80, 150) if is_capture else color.rgba(135, 206, 250, 150)
+                
+                pos = self.square_to_pos(move.to_square)
+                highlighter = Entity(
+                    model='quad',
+                    color=highlight_color,
+                    position=(pos.x, 0.3, pos.z),
+                    scale=4,
+                    rotation_x=90,
+                    double_sided=True,
+                    collider='box' # Make it clickable
+                )
+                self.highlight_squares.append(highlighter)
+
+    def clear_highlights(self):
+        """Removes all highlight squares from the scene."""
+        [destroy(s) for s in self.highlight_squares]
+        self.highlight_squares = []
+
+    def update_ui(self):
+        """Updates the on-screen text for turn and game status."""
+        turn = "White" if self.board.turn == chess.WHITE else "Black"
+        self.turn_display.text = f"Turn: {turn}"
+        
+        status = ""
+        if self.board.is_checkmate():
+            status = f"Checkmate! {('Black', 'White')[self.board.turn]} wins."
+            self.end_game_display.text = status
+            self.restart_button.visible = True
+        elif self.board.is_stalemate() or self.board.is_insufficient_material():
+            status = "Draw"
+            self.end_game_display.text = status
+            self.restart_button.visible = True
+        elif self.board.is_check():
+            status = "Check!"
+            self.check_sound.play()
+            
+        self.status_display.text = status
+
+    def restart_game(self):
+        """Resets the game to the initial state."""
+        self.board.reset()
+        [destroy(p) for p in self.piece_entities.values() if p]
+        self.piece_entities.clear()
+        self.clear_highlights()
+        self.end_game_display.text = ""
+        self.restart_button.visible = False
+        self.create_board_and_pieces()
+        self.update_ui()
+        
+    # --- Coordinate Conversion Helper Functions ---
+    def square_to_pos(self, square_index: int) -> Vec3:
+        """Converts a chess.SQUARE index to an Ursina 3D position."""
+        return Vec3(chess.square_file(square_index) * 4 - 14, 0.5, chess.square_rank(square_index) * 4 - 14)
+
+    def pos_to_square(self, pos: Vec3) -> str:
+        """Converts an Ursina 3D position back to a square name (e.g., 'e2')."""
+        file_idx = int(round((pos.x + 14) / 4))
+        rank_idx = int(round((pos.z + 14) / 4))
+        return f"{chr(ord('a') + file_idx)}{rank_idx + 1}"
+
+if __name__ == '__main__':
+    app = MedievalChess()
+    app.run()
+
